@@ -1,24 +1,25 @@
 """
-Controle Financeiro — NovaVoid Studio (v3.2)
+Controle Financeiro — NovaVoid Studio (v3.4)
 
 Instalar:  sudo apt install python3-tk
            pip install customtkinter matplotlib --break-system-packages
 Rodar:     python3 controle_financeiro_v3.py
 
 Dados: ~/.local/share/Financas/financas.json (Linux) ou %APPDATA%\\Financas (Windows).
-Lê automaticamente os dados da V1/V2.
+Lê automaticamente os dados da V1/V2. Uma cópia por dia fica em .../Financas/backups (últimas 14).
 
 Tela principal: calendário mensal dia a dia (entradas, saídas e saldo de cada dia),
 com totais por dia da semana e simulação de "e se a diária não cair?".
 
 Atalhos: Enter (salvar), Esc (cancelar edição / sair da tela cheia), Delete (excluir),
          Ctrl+Z (desfazer exclusão), Ctrl+N (novo lançamento),
-         F11 (tela cheia), F1 (guia rápido).
+         F11 (tela cheia), F1 (guia rápido), F2 (ajustes: diária padrão e reserva mínima).
 """
 import calendar
 import csv
 import json
 import os
+import re
 import shutil
 import traceback
 import uuid
@@ -39,7 +40,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 EMPRESA = "NovaVoid Studio"
 APP = "Controle Financeiro"
-VERSAO = "3.2"
+VERSAO = "3.4"
+MAX_LOTE = 400  # máximo de lançamentos criados de uma vez por uma repetição
+MAX_DESC = 80   # tamanho máximo da descrição
+MAX_CAT = 30    # tamanho máximo do nome de categoria
 
 
 def pasta_dados() -> Path:
@@ -63,6 +67,7 @@ DIAS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"]
 DIAS_LONGOS = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira",
                "Sexta-feira", "Sábado"]
 PLURAL = ["domingos", "segundas", "terças", "quartas", "quintas", "sextas", "sábados"]
+MODOS_REP = ["Não repetir", "Todo mês", "Toda semana", "Dias da semana escolhidos"]
 MESES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto",
          "Setembro", "Outubro", "Novembro", "Dezembro"]
 TITULOS = {"data": "Data", "tipo": "Tipo", "categoria": "Categoria",
@@ -142,31 +147,45 @@ def fmt_input(c: int) -> str:
 
 
 def compacto(c: int) -> str:
-    """Valor curto para as células do calendário (sem R$ e sem sinal)."""
-    reais, cent = divmod(abs(c), 100)
-    s = f"{reais:,}".replace(",", ".")
-    return s + (f",{cent:02d}" if cent else "")
+    """Valor curto para as células do calendário (sem R$ e sem sinal; sem centavos a partir de R$ 1.000)."""
+    c = abs(c)
+    if c >= 100000:
+        return f"{(c + 50) // 100:,}".replace(",", ".")
+    reais, cent = divmod(c, 100)
+    return f"{reais:,}".replace(",", ".") + (f",{cent:02d}" if cent else "")
+
+
+_RE_MILHAR = re.compile(r"^\d{1,3}(\.\d{3})+(,\d{1,2})?$")  # 1.250 | 1.250,90
+_RE_SIMPLES = re.compile(r"^\d+([.,]\d{1,2})?$")             # 1250 | 1250,9 | 1250.90
 
 
 def parse_centavos(txt: str) -> int:
-    txt = txt.replace("R$", "").replace(" ", "").strip()
-    if "," in txt:
-        txt = txt.replace(".", "").replace(",", ".")
-    v = Decimal(txt)
+    """Converte '1.250,90', '1250,90', '1250.90' ou 'R$ 15' em centavos. Levanta ValueError se inválido."""
+    t = txt.replace("R$", "").replace(" ", "").strip()
+    if _RE_MILHAR.match(t):
+        t = t.replace(".", "").replace(",", ".")
+    elif _RE_SIMPLES.match(t):
+        t = t.replace(",", ".")
+    else:
+        raise ValueError
+    v = Decimal(t)
     if v <= 0 or v > Decimal("1000000000"):
         raise ValueError
     return int((v * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def parse_data(txt: str) -> date:
-    """Aceita dd/mm/aaaa, dd/mm/aa, dd/mm (ano atual) e 'hoje'."""
+    """Aceita dd/mm/aaaa, dd/mm/aa, dd/mm (ano atual), aaaa-mm-dd, 'hoje', 'ontem' e 'amanhã'."""
     txt = txt.strip().lower()
-    if txt == "hoje":
-        return date.today()
-    partes = txt.replace("-", "/").replace(".", "/").split("/")
+    atalhos = {"hoje": 0, "ontem": -1, "amanha": 1, "amanhã": 1}
+    if txt in atalhos:
+        return date.today() + timedelta(days=atalhos[txt])
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", txt):
+        return date.fromisoformat(txt)
+    partes = [p.strip() for p in txt.replace("-", "/").replace(".", "/").split("/")]
     if len(partes) == 2:
         partes.append(str(date.today().year))
-    if len(partes) != 3:
+    if len(partes) != 3 or not all(p.isdigit() for p in partes):
         raise ValueError
     d, m, a = (int(p) for p in partes)
     return date(a + 2000 if a < 100 else a, m, d)
@@ -186,6 +205,52 @@ def status_txt(d: dict) -> str:
     if d["pago"]:
         return "✓ Recebido" if d["tipo"] == "Receita" else "✓ Pago"
     return "! Vencido" if vencido(d) else "○ Pendente"
+
+
+def normalizar_lancamento(d, ids_usados: set):
+    """Valida um lançamento lido do arquivo. Devolve um dict limpo ou None se for inválido."""
+    try:
+        tipo = d.get("tipo")
+        if tipo not in ("Receita", "Despesa"):
+            return None
+        cents = int(d["centavos"]) if "centavos" in d else int(round(float(d["valor"]) * 100))
+        if cents <= 0:
+            return None
+        data = date.fromisoformat(str(d["data"])[:10]).isoformat()
+        ident = str(d.get("id") or "")
+        if not ident or ident in ids_usados:  # V1 podia não ter id (ou repetir)
+            ident = uuid.uuid4().hex
+        ids_usados.add(ident)
+        novo = {"id": ident, "tipo": tipo, "data": data, "centavos": cents,
+                "descricao": (str(d.get("descricao") or "").strip() or "(sem descrição)")[:MAX_DESC],
+                "categoria": (str(d.get("categoria") or "").strip() or "Outros")[:MAX_CAT],
+                "pago": bool(d.get("pago", True))}
+        if d.get("serie"):  # liga os lançamentos criados juntos por uma repetição
+            novo["serie"] = str(d["serie"])[:64]
+        return novo
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None
+
+
+def efeito_previsto(d: dict, hoje: str, simular: bool) -> int:
+    """Quanto o lançamento mexe no caixa previsto (centavos, com sinal).
+    Pago conta sempre. Despesa pendente conta (ainda vai ser paga). Receita pendente só conta
+    se ainda é esperada (data de hoje em diante) e não estiver simulando 'a diária não caiu'."""
+    c = d["centavos"]
+    if d["pago"]:
+        return c if d["tipo"] == "Receita" else -c
+    if d["tipo"] == "Despesa":
+        return -c
+    return c if (d["data"] >= hoje and not simular) else 0
+
+
+def csv_seguro(t: str) -> str:
+    """Impede que Excel/LibreOffice interprete texto como fórmula (=, +, -, @)."""
+    return "'" + t if t[:1] in ("=", "+", "-", "@", "\t", "\r") else t
+
+
+def csv_limpo(t: str) -> str:
+    return t[1:] if t[:1] == "'" and t[1:2] in ("=", "+", "-", "@") else t
 
 
 # ---------- logo minimalista da NovaVoid (anel roxo/azul cortado por uma lâmina branca) ----------
@@ -292,6 +357,8 @@ PASSOS = [
      "2) No painel da direita, clique em ＋ Diária ou ＋ Gasto.\n"
      "3) O formulário da esquerda já vem com a data do dia. Digite o valor e clique em "
      "Adicionar.\n\n"
+     "Dica: em ⚙ Ajustes (ou F2) você define o VALOR PADRÃO DA DIÁRIA. Aí o ＋ Diária já vem "
+     "com o valor preenchido e basta apertar Enter.\n\n"
      "A caixinha 'Já pago / recebido' diz se o dinheiro já caiu. Diária que ainda não caiu? "
      "Desmarque: ela fica Pendente (○) até você marcar como recebida."),
     ("4. E se a diária não cair?",
@@ -299,13 +366,20 @@ PASSOS = [
      "• Em caixa hoje: o dinheiro que você realmente tem.\n"
      "• Fôlego: por quantos dias esse dinheiro dura no ritmo de gastos dos últimos 30 dias.\n"
      "• Menor saldo previsto: o pior dia do mês. Se ficar negativo (!), vai faltar dinheiro.\n\n"
+     "Em ⚙ Ajustes você também pode definir uma RESERVA MÍNIMA (ex.: R$ 100). Os dias em que o "
+     "saldo previsto ficar abaixo dela aparecem com ⚠, e um aviso diz em quantos dias isso "
+     "acontece (ou quando o dinheiro acaba).\n\n"
      "Ligue o interruptor 'E se a diária não cair?' para ver o mês sem contar nenhuma diária "
      "pendente. Diárias de dias que já passaram e não foram marcadas como recebidas também "
      "não são contadas (✕)."),
-    ("5. Contas que se repetem",
-     "No campo 'Repetir por N meses', digite por quantos meses a conta se repete. "
-     "Ex.: aluguel de 800,00 repetindo 12 vezes cria 12 lançamentos, um por mês.\n\n"
-     "Os meses futuros ficam Pendentes automaticamente. Deixe vazio para lançar uma vez só."),
+    ("5. Repetir lançamentos",
+     "Na caixa 'Repetição', ao criar um lançamento, escolha:\n\n"
+     "• Todo mês: aluguel, internet... (ex.: 12 meses). Vira (1/12), (2/12)...\n"
+     "• Toda semana: no mesmo dia da semana da data (ex.: 8 semanas).\n"
+     "• Dias da semana escolhidos: marque os dias (ex.: Seg–Sex) e quantas semanas. "
+     "Ótimo para passagem e marmita, ou diárias combinadas.\n\n"
+     "Os lançamentos futuros ficam Pendentes automaticamente. Ao excluir um deles, o programa "
+     "pergunta se você quer apagar só ele ou ele e os seguintes."),
     ("6. Marcar como pago, editar e excluir",
      "Clique em um lançamento no painel do dia (ou na aba Lançamentos) e use os botões:\n\n"
      "• ✓ Pago / Pendente: troca o status\n"
@@ -409,11 +483,98 @@ class Tutorial(ctk.CTkToplevel):
         self.destroy()
 
 
+def valor_ou_none(txt: str):
+    """Campo opcional em R$: vazio (ou 0) = desligado. Levanta ValueError se for inválido."""
+    t = txt.strip()
+    if t in ("", "0", "0,00", "0.00"):
+        return None
+    return parse_centavos(t)
+
+
+class Ajustes(ctk.CTkToplevel):
+    """Valor padrão da diária e reserva mínima."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Ajustes do calendário")
+        self.resizable(False, False)
+        w, h = 480, 420
+        x = max(0, app.winfo_rootx() + (app.winfo_width() - w) // 2)
+        y = max(0, app.winfo_rooty() + (app.winfo_height() - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        ctk.CTkLabel(self, text="Ajustes do calendário", font=ctk.CTkFont(size=22, weight="bold")
+                     ).pack(anchor="w", padx=28, pady=(22, 2))
+        ctk.CTkLabel(self, text="Deixe em branco para desligar.", text_color=MUTED
+                     ).pack(anchor="w", padx=28)
+
+        ctk.CTkLabel(self, text="Valor padrão da diária (R$)", font=ctk.CTkFont(size=14, weight="bold")
+                     ).pack(anchor="w", padx=28, pady=(18, 0))
+        self.e_dia = ctk.CTkEntry(self, placeholder_text="Ex.: 180,00", height=38)
+        self.e_dia.pack(fill="x", padx=28, pady=(4, 0))
+        ctk.CTkLabel(self, text="O botão ＋ Diária já preenche este valor. É só conferir e apertar Enter.",
+                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=420, justify="left"
+                     ).pack(anchor="w", padx=28, pady=(3, 0))
+
+        ctk.CTkLabel(self, text="Reserva mínima (R$)", font=ctk.CTkFont(size=14, weight="bold")
+                     ).pack(anchor="w", padx=28, pady=(18, 0))
+        self.e_res = ctk.CTkEntry(self, placeholder_text="Ex.: 100,00", height=38)
+        self.e_res.pack(fill="x", padx=28, pady=(4, 0))
+        ctk.CTkLabel(self, text="O calendário marca com ⚠ os dias em que o saldo previsto ficar abaixo "
+                                "desse valor e avisa em quantos dias isso vai acontecer.",
+                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=420, justify="left"
+                     ).pack(anchor="w", padx=28, pady=(3, 0))
+
+        self.l_erro = ctk.CTkLabel(self, text="", text_color=ROXO_TXT)
+        self.l_erro.pack(anchor="w", padx=28, pady=(10, 0))
+        rod = ctk.CTkFrame(self, fg_color="transparent")
+        rod.pack(fill="x", padx=28, pady=(8, 20), side="bottom")
+        ctk.CTkButton(rod, text="Cancelar", width=100, fg_color=SUAVE, hover_color=BORDA, text_color=TEXTO,
+                      command=self.destroy).pack(side="left")
+        ctk.CTkButton(rod, text="Salvar", width=120, height=36, fg_color=AZUL, hover_color=AZUL_H,
+                      command=self.salvar).pack(side="right")
+
+        for chave, e in (("diaria_padrao", self.e_dia), ("reserva_minima", self.e_res)):
+            if app.cfg.get(chave):
+                e.insert(0, fmt_input(app.cfg[chave]))
+            e.bind("<Return>", lambda ev: self.salvar())
+        self.bind("<Escape>", lambda ev: self.destroy())
+        self.after(200, self._foco)
+
+    def _foco(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.e_dia.focus()
+        except tk.TclError:
+            pass
+
+    def salvar(self):
+        try:
+            dia = valor_ou_none(self.e_dia.get())
+        except (ValueError, InvalidOperation):
+            return self.l_erro.configure(text="⚠ Valor da diária inválido (ex.: 180,00).")
+        try:
+            res = valor_ou_none(self.e_res.get())
+        except (ValueError, InvalidOperation):
+            return self.l_erro.configure(text="⚠ Reserva mínima inválida (ex.: 100,00).")
+        self.app.cfg["diaria_padrao"] = dia
+        self.app.cfg["reserva_minima"] = res
+        self.app.salvar()
+        self.app.atualizar_calendario()
+        self.app.aviso("Ajustes salvos.", ok=True)
+        self.destroy()
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.lanc = []
         self.cfg = {"tema": "dark", "metas": {}, "tutorial_visto2": False,
+                    "diaria_padrao": None, "reserva_minima": None,
                     "categorias": {"Despesa": list(CAT_DESPESA), "Receita": list(CAT_RECEITA)}}
         erro = self.carregar()
         ctk.set_appearance_mode(self.cfg["tema"])
@@ -430,6 +591,8 @@ class App(ctk.CTk):
         self.lixeira = []
         self._aviso_id = None
         self._tut = None
+        self._ajustes = None
+        self._rep_visivel = True
         self.tela_cheia = False
         self.fonte = tkfont.nametofont("TkDefaultFont").actual("family")
         self.report_callback_exception = self.erro_inesperado
@@ -448,7 +611,10 @@ class App(ctk.CTk):
         self.bind("<F11>", self.alternar_tela_cheia)
         self.bind("<Escape>", self.sair_tela_cheia)
         self.bind("<F1>", self.abrir_tutorial)
+        self.bind("<F2>", self.abrir_ajustes)
         self.after(200, self.maximizar)
+        self._hoje = date.today()
+        self.after(60000, self._tick)
         if erro:
             self.after(300, lambda: messagebox.showwarning("Arquivo de dados", erro))
         if not self.cfg.get("tutorial_visto2"):
@@ -462,6 +628,13 @@ class App(ctk.CTk):
             self._icone = img
         except Exception:
             pass
+
+    def _tick(self):
+        """Se o app ficar aberto na virada do dia, atualiza o 'hoje' do calendário."""
+        if date.today() != self._hoje:
+            self._hoje = date.today()
+            self.atualizar()
+        self.after(60000, self._tick)
 
     def maximizar(self):
         try:
@@ -496,6 +669,15 @@ class App(ctk.CTk):
             pass
         self._tut = Tutorial(self)
 
+    def abrir_ajustes(self, _e=None):
+        try:
+            if self._ajustes is not None and self._ajustes.winfo_exists():
+                self._ajustes.lift()
+                return
+        except tk.TclError:
+            pass
+        self._ajustes = Ajustes(self)
+
     def erro_inesperado(self, exc, val, tb):
         txt = "".join(traceback.format_exception(exc, val, tb))
         log = PASTA / "erro.log"
@@ -510,41 +692,84 @@ class App(ctk.CTk):
         origem = next((p for p in (ARQUIVO, LEGADO) if p.exists()), None)
         if not origem:
             return None
+        descartados = 0
         try:
             bruto = json.loads(origem.read_text(encoding="utf-8"))
             if isinstance(bruto, list):  # formato da V1
                 bruto = {"lancamentos": bruto}
-            lanc = bruto.get("lancamentos", [])
-            cfg = bruto.get("config", {})
-            cats = {t: list(cfg.get("categorias", {}).get(t) or self.cfg["categorias"][t])
+            if not isinstance(bruto, dict):
+                raise ValueError("formato inesperado")
+            cfg = bruto.get("config") or {}
+            cats = {t: list((cfg.get("categorias") or {}).get(t) or self.cfg["categorias"][t])
                     for t in ("Despesa", "Receita")}
             if "Diária" not in cats["Receita"]:
                 cats["Receita"].insert(0, "Diária")
-            for d in lanc:
-                if "centavos" not in d:  # V1 guardava float
-                    d["centavos"] = int(round(float(d.pop("valor")) * 100))
-                d.setdefault("pago", True)
+            usados, lanc = set(), []
+            for bruto_d in bruto.get("lancamentos") or []:
+                d = normalizar_lancamento(bruto_d, usados)
+                if d is None:  # um registro ruim não derruba o arquivo inteiro
+                    descartados += 1
+                    continue
+                lanc.append(d)
                 if d["categoria"] not in cats[d["tipo"]]:
                     cats[d["tipo"]].append(d["categoria"])
+            metas = {}
+            for k, v in (cfg.get("metas") or {}).items():
+                try:
+                    metas[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    pass
             self.lanc = lanc
-            self.cfg["tema"] = cfg.get("tema", "dark")
-            self.cfg["metas"] = {k: int(v) for k, v in cfg.get("metas", {}).items()}
+            self.cfg["tema"] = "light" if cfg.get("tema") == "light" else "dark"
+            self.cfg["metas"] = metas
             self.cfg["categorias"] = cats
             self.cfg["tutorial_visto2"] = bool(cfg.get("tutorial_visto2", False))
+            for chave in ("diaria_padrao", "reserva_minima"):
+                v = cfg.get(chave)
+                ok = isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 10 ** 11
+                self.cfg[chave] = int(v) if ok else None
         except Exception:
             copia = PASTA / f"corrompido-{datetime.now():%Y%m%d-%H%M%S}.json"
-            shutil.copy2(origem, copia)
+            try:
+                shutil.copy2(origem, copia)
+            except OSError:
+                pass
             self.lanc = []
             return f"Não consegui ler {origem.name}.\nUma cópia foi guardada em:\n{copia}"
+        aviso = None
+        if descartados:
+            copia = PASTA / f"original-{datetime.now():%Y%m%d-%H%M%S}.json"
+            try:
+                shutil.copy2(origem, copia)
+            except OSError:
+                pass
+            aviso = (f"{descartados} lançamento(s) inválido(s) foram ignorados.\n"
+                     f"O arquivo original foi guardado em:\n{copia}")
         if origem is LEGADO:
             self.salvar()
-        return None
+        return aviso
+
+    def _backup_diario(self):
+        """Uma cópia por dia em Financas/backups (guarda as últimas 14)."""
+        try:
+            if not ARQUIVO.exists():
+                return
+            pasta = PASTA / "backups"
+            pasta.mkdir(exist_ok=True)
+            alvo = pasta / f"financas-{date.today():%Y-%m-%d}.json"
+            if not alvo.exists():
+                shutil.copy2(ARQUIVO, alvo)
+            for antigo in sorted(pasta.glob("financas-*.json"))[:-14]:
+                antigo.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def salvar(self):
         try:
             tmp = ARQUIVO.with_suffix(".tmp")
             tmp.write_text(json.dumps({"versao": 3, "config": self.cfg, "lancamentos": self.lanc},
                                       ensure_ascii=False, indent=1), encoding="utf-8")
+            self._backup_diario()
             if ARQUIVO.exists():
                 shutil.copy2(ARQUIVO, ARQUIVO.with_suffix(".bak"))
             tmp.replace(ARQUIVO)
@@ -618,7 +843,7 @@ class App(ctk.CTk):
         ctk.CTkFrame(lat, height=2, fg_color=BORDA).pack(side="top", fill="x", padx=24, pady=(14, 8))
 
         # ---- formulário (rola se a tela for pequena) ----
-        corpo = ctk.CTkScrollableFrame(lat, fg_color="transparent")
+        corpo = self.corpo = ctk.CTkScrollableFrame(lat, fg_color="transparent")
         corpo.pack(side="top", fill="both", expand=True, padx=(10, 6))
 
         self.l_modo = ctk.CTkLabel(corpo, text="Novo lançamento", font=ctk.CTkFont(size=14, weight="bold"))
@@ -641,16 +866,98 @@ class App(ctk.CTk):
         self.cat = ctk.CTkComboBox(corpo, values=self.cfg["categorias"]["Despesa"], height=36)
         self.cat.set(self.cfg["categorias"]["Despesa"][0])
         self.cat.pack(padx=8, pady=(2, 0), fill="x")
-        self.e_rep = self.campo(corpo, "Repetir por N meses (vazio = 1)")
-        Dica(self.e_rep, "Para contas fixas. Ex.: 12 cria o mesmo lançamento por 12 meses seguidos.")
+        # --- repetição: todo mês, toda semana ou dias da semana escolhidos ---
+        self.f_rep = ctk.CTkFrame(corpo, fg_color="transparent")
+        self.f_rep.pack(fill="x", padx=8, pady=(10, 0))
+        ctk.CTkLabel(self.f_rep, text="Repetição", text_color=MUTED, font=ctk.CTkFont(size=11)
+                     ).pack(anchor="w")
+        self.m_rep = ctk.CTkOptionMenu(self.f_rep, values=MODOS_REP, height=32,
+                                       command=lambda _: self.atualizar_rep_ui())
+        self.m_rep.set(MODOS_REP[0])
+        self.m_rep.pack(fill="x", pady=(2, 0))
+        Dica(self.m_rep, "Repete o lançamento: todo mês (contas fixas), toda semana ou só nos "
+                         "dias da semana que você escolher (ex.: passagem de seg a sex).")
+        self.f_dias = ctk.CTkFrame(self.f_rep, fg_color="transparent")
+        self.rep_dias = [False] * 7
+        self.b_dias = []
+        for i, nome in enumerate(DIAS):
+            b = ctk.CTkButton(self.f_dias, text=nome, width=34, height=28, corner_radius=6,
+                              font=ctk.CTkFont(size=10, weight="bold"), fg_color=SUAVE, hover_color=BORDA,
+                              text_color=TEXTO, command=lambda i=i: self.alternar_dia_rep(i))
+            b.grid(row=0, column=i, padx=1)
+            self.b_dias.append(b)
+        for col, (txt, cmd) in enumerate((("Seg–Sex", self.preset_semana), ("Limpar", self.limpar_dias))):
+            ctk.CTkButton(self.f_dias, text=txt, width=70, height=24, font=ctk.CTkFont(size=10),
+                          fg_color="transparent", border_width=1, border_color=BORDA, text_color=TEXTO,
+                          hover_color=SUAVE, command=cmd).grid(row=1, column=col * 3, columnspan=3,
+                                                              pady=(5, 0), sticky="w")
+        self.e_rep = ctk.CTkEntry(self.f_rep, placeholder_text="", height=36)
+        Dica(self.e_rep, "Quantas vezes repetir: meses (até 60) ou semanas (até 52).")
         self.var_pago = ctk.BooleanVar(value=True)
-        chk = ctk.CTkCheckBox(corpo, text="Já pago / recebido", variable=self.var_pago)
+        chk = self.chk_pago = ctk.CTkCheckBox(corpo, text="Já pago / recebido", variable=self.var_pago)
         chk.pack(padx=8, pady=(14, 8), anchor="w")
         Dica(chk, "Desmarque se ainda vai pagar/receber. Fica como Pendente e entra em 'A pagar'.")
 
         for e in (self.e_desc, self.e_valor, self.e_data, self.e_rep):
             e.bind("<Return>", lambda ev: self.confirmar())
             e.bind("<Escape>", self._esc_campo)
+
+    def atualizar_rep_ui(self):
+        """Mostra só o que o modo de repetição escolhido precisa."""
+        modo = self.m_rep.get()
+        self.f_dias.pack_forget()
+        self.e_rep.pack_forget()
+        if modo == MODOS_REP[0]:
+            return
+        if modo == MODOS_REP[3]:
+            if not any(self.rep_dias):  # começa marcando o dia da semana da data digitada
+                try:
+                    self.rep_dias[(parse_data(self.e_data.get()).weekday() + 1) % 7] = True
+                except ValueError:
+                    pass
+                self.pintar_dias_rep()
+            self.f_dias.pack(fill="x", pady=(6, 0))
+        self.e_rep.configure(placeholder_text="Quantos meses? (ex.: 12)" if modo == MODOS_REP[1]
+                             else "Quantas semanas? (ex.: 4)")
+        self.e_rep.pack(fill="x", pady=(6, 0))
+        self.after(60, self._rolar_form)
+
+    def _rolar_form(self):
+        """Rola o formulário até o fim para as opções de repetição ficarem visíveis."""
+        try:
+            self.update_idletasks()
+            self.corpo._parent_canvas.yview_moveto(1.0)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def pintar_dias_rep(self):
+        for i, b in enumerate(self.b_dias):
+            on = self.rep_dias[i]
+            b.configure(fg_color=ROXO if on else SUAVE, text_color=BRANCO if on else TEXTO)
+
+    def alternar_dia_rep(self, i):
+        self.rep_dias[i] = not self.rep_dias[i]
+        self.pintar_dias_rep()
+
+    def preset_semana(self):
+        self.rep_dias = [0 < i < 6 for i in range(7)]  # segunda a sexta
+        self.pintar_dias_rep()
+
+    def limpar_dias(self):
+        self.rep_dias = [False] * 7
+        self.pintar_dias_rep()
+
+    def mostrar_rep(self, resetar=True):
+        """Mostra o bloco de repetição (some ao editar). resetar=True volta para 'Não repetir'."""
+        if resetar:
+            self.m_rep.set(MODOS_REP[0])
+            self.rep_dias = [False] * 7
+            self.pintar_dias_rep()
+            self.e_rep.delete(0, "end")
+        self.atualizar_rep_ui()
+        if not self._rep_visivel:
+            self.f_rep.pack(fill="x", padx=8, pady=(10, 0), before=self.chk_pago)
+            self._rep_visivel = True
 
     def _esc_campo(self, _ev=None):
         # Esc no campo cancela a edição; fora de edição deixa o Esc sair da tela cheia
@@ -749,6 +1056,10 @@ class App(ctk.CTk):
         b_hoje = ctk.CTkButton(topo, text="Hoje", width=60, height=28, command=self.ir_hoje)
         b_hoje.pack(side="right")
         Dica(b_hoje, "Volta para o mês atual e seleciona o dia de hoje.")
+        b_aj = ctk.CTkButton(topo, text="⚙ Ajustes", width=84, height=28, fg_color=SUAVE, hover_color=BORDA,
+                             text_color=TEXTO, command=self.abrir_ajustes)
+        b_aj.pack(side="right", padx=(0, 8))
+        Dica(b_aj, "Valor padrão da diária e reserva mínima (F2).")
         self.sw_sim = ctk.CTkSwitch(topo, text="E se a diária não cair?", command=self.atualizar_calendario)
         self.sw_sim.pack(side="right", padx=14)
         Dica(self.sw_sim, "Mostra o mês sem contar nenhuma diária pendente. "
@@ -757,11 +1068,14 @@ class App(ctk.CTk):
         ind = ctk.CTkFrame(esq, fg_color="transparent")
         ind.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(0, 6))
         fn = ctk.CTkFont(size=12, weight="bold")
-        self.l_caixa = ctk.CTkLabel(ind, text="", font=fn)
+        linha = ctk.CTkFrame(ind, fg_color="transparent")
+        linha.pack(fill="x")
+        self.l_alerta = ctk.CTkLabel(ind, text="", font=fn, anchor="w", justify="left", wraplength=640)
+        self.l_caixa = ctk.CTkLabel(linha, text="", font=fn)
         self.l_caixa.pack(side="left", padx=(0, 16))
-        self.l_folego = ctk.CTkLabel(ind, text="", font=fn)
+        self.l_folego = ctk.CTkLabel(linha, text="", font=fn)
         self.l_folego.pack(side="left", padx=(0, 16))
-        self.l_menor = ctk.CTkLabel(ind, text="", font=fn)
+        self.l_menor = ctk.CTkLabel(linha, text="", font=fn)
         self.l_menor.pack(side="left")
         Dica(self.l_caixa, "Dinheiro que você realmente tem hoje (só o que já foi pago/recebido).")
         Dica(self.l_folego, "Por quantos dias o dinheiro em caixa dura, no ritmo de gastos dos últimos 30 dias.")
@@ -778,7 +1092,7 @@ class App(ctk.CTk):
 
         f_dia = ctk.CTkFont(size=12, weight="bold")
         f_val = ctk.CTkFont(size=11, weight="bold")
-        f_sal = ctk.CTkFont(size=9)
+        f_sal = ctk.CTkFont(size=10)
         for k in range(42):
             r, c = divmod(k, 7)
             f = ctk.CTkFrame(esq, corner_radius=8, fg_color=CARTAO, border_width=2, border_color=BORDA)
@@ -890,6 +1204,79 @@ class App(ctk.CTk):
             return None
         return date.fromisoformat(self.sel[1])
 
+    def alerta_reserva(self, hoje: date, simular: bool):
+        """Nos próximos 60 dias: primeiro dia com saldo previsto negativo e primeiro abaixo da reserva.
+        Devolve (negativo, baixo); cada um é None ou (dias_até_lá, data, saldo)."""
+        reserva = self.cfg.get("reserva_minima") or 0
+        h = hoje.isoformat()
+        fim = (hoje + timedelta(days=59)).isoformat()
+        saldo = sum(efeito_previsto(d, h, simular) for d in self.lanc if d["data"] < h)
+        por_data = {}
+        for d in self.lanc:
+            if h <= d["data"] <= fim:
+                por_data.setdefault(d["data"], []).append(d)
+        neg = baixo = None
+        for k in range(60):
+            dia = hoje + timedelta(days=k)
+            saldo += sum(efeito_previsto(d, h, simular) for d in por_data.get(dia.isoformat(), []))
+            if baixo is None and reserva and saldo < reserva:
+                baixo = (k, dia, saldo)
+            if saldo < 0:
+                neg = (k, dia, saldo)
+                break
+        return neg, baixo
+
+    def atualizar_alerta(self, hoje: date, simular: bool):
+        reserva = self.cfg.get("reserva_minima") or 0
+        neg, baixo = self.alerta_reserva(hoje, simular)
+
+        def quando(k, dia):
+            return ("Hoje" if k == 0 else "Amanhã" if k == 1 else f"Em {k} dias") + f" ({dia:%d/%m})"
+
+        pre = "Sem as diárias pendentes: " if simular else ""
+        linhas = []
+        if baixo and (not neg or baixo[0] < neg[0]):
+            linhas.append(f"⚠ {pre}{quando(baixo[0], baixo[1])} o saldo previsto cai abaixo da sua reserva "
+                          f"de {brl(reserva)} (fica em {brl(baixo[2])}).")
+        if neg:
+            linhas.append(f"! {pre}{quando(neg[0], neg[1])} o dinheiro acaba: saldo previsto {brl(neg[2])}.")
+        if linhas:
+            self.l_alerta.configure(text="\n".join(linhas), text_color=TEXTO if neg else ROXO_TXT)
+            self.l_alerta.pack(anchor="w", pady=(3, 0))
+        elif reserva:
+            self.l_alerta.configure(text=f"✓ {pre}Saldo previsto acima da reserva ({brl(reserva)}) "
+                                         "nos próximos 60 dias.", text_color=AZUL_TXT)
+            self.l_alerta.pack(anchor="w", pady=(3, 0))
+        else:
+            self.l_alerta.pack_forget()
+
+    def media_historica(self, i):
+        """Média por dia da semana i (0=dom) de tudo que foi pago até hoje: (dias, entrada, saída)."""
+        h = date.today()
+        pagos = [d for d in self.lanc if d["pago"] and d["data"] <= h.isoformat()]
+        if not pagos:
+            return None
+        primeiro = date.fromisoformat(min(d["data"] for d in pagos))
+        total = (h - primeiro).days + 1
+        desloc = (i - (primeiro.weekday() + 1) % 7) % 7
+        n = 0 if desloc >= total else (total - desloc - 1) // 7 + 1
+        if n < 1:
+            return None
+        rec = sum(d["centavos"] for d in pagos
+                  if d["tipo"] == "Receita" and (date.fromisoformat(d["data"]).weekday() + 1) % 7 == i)
+        desp = sum(d["centavos"] for d in pagos
+                   if d["tipo"] == "Despesa" and (date.fromisoformat(d["data"]).weekday() + 1) % 7 == i)
+        return n, rec // n, desp // n
+
+    def _txt_historico(self, i):
+        mh = self.media_historica(i)
+        if not mh:
+            return ""
+        n, r, s = mh
+        nome = DIAS_LONGOS[i].split("-")[0].lower()
+        return (f"\nHistórico ({n} {nome if n == 1 else PLURAL[i]}, só o que foi pago): "
+                f"+{brl(r)} / −{brl(s)} por {nome}")
+
     def lancar_diaria(self):
         d = self._data_sel()
         if not d:
@@ -902,8 +1289,19 @@ class App(ctk.CTk):
         self.e_data.delete(0, "end")
         self.e_data.insert(0, d.strftime("%d/%m/%Y"))
         self.var_pago.set(d <= date.today())
-        self.e_valor.focus()
-        self.aviso(f"Diária de {d:%d/%m}: digite o valor e clique em Adicionar.", ok=True)
+        padrao = self.cfg.get("diaria_padrao")
+        if padrao:
+            self.e_valor.insert(0, fmt_input(padrao))
+            self.e_valor.focus()
+            try:
+                self.e_valor.select_range(0, "end")
+            except (tk.TclError, AttributeError):
+                pass
+            self.aviso(f"Diária de {d:%d/%m} ({brl(padrao)}): confira e aperte Enter.", ok=True)
+        else:
+            self.e_valor.focus()
+            self.aviso(f"Diária de {d:%d/%m}: digite o valor e clique em Adicionar "
+                       "(dica: ⚙ Ajustes define um valor padrão).", ok=True)
 
     def lancar_gasto(self):
         d = self._data_sel()
@@ -928,6 +1326,7 @@ class App(ctk.CTk):
         h = date.today()
         hoje = h.isoformat()
         simular = bool(self.sw_sim.get())
+        reserva = self.cfg.get("reserva_minima") or 0
         pref = f"{ano:04d}-{mes:02d}"
 
         # indicadores: caixa de hoje e fôlego (ritmo de gastos dos últimos 30 dias)
@@ -948,11 +1347,11 @@ class App(ctk.CTk):
         else:
             fol = f"≈ {int(caixa // media)} dia(s)"
         self.l_folego.configure(text=f"Fôlego: {fol}", text_color=TEXTO)
+        self.atualizar_alerta(h, simular)
 
-        # saldo acumulado até o início do mês (só o que foi pago)
+        # saldo previsto no início do mês: tudo que veio antes, pelas mesmas regras dos dias do mês
         inicio = f"{pref}-01"
-        saldo = sum((d["centavos"] if d["tipo"] == "Receita" else -d["centavos"])
-                    for d in self.lanc if d["pago"] and d["data"] < inicio)
+        saldo = sum(efeito_previsto(d, hoje, simular) for d in self.lanc if d["data"] < inicio)
         por_dia = {}
         for d in self.lanc:
             if d["data"].startswith(pref):
@@ -1026,7 +1425,8 @@ class App(ctk.CTk):
             iso = f"{pref}-{dia:02d}"
             rec_prev, rec_exc, desp_pend, desp_venc, rec, desp, sfim, tem = info[dia]
             marcado = self.sel == ("dia", iso)
-            f.configure(fg_color=SUAVE if sfim < 0 else CARTAO, border_width=2,
+            baixo = bool(reserva) and 0 <= sfim < reserva and iso >= hoje  # abaixo da reserva (de hoje em diante)
+            f.configure(fg_color=SUAVE if (sfim < 0 or baixo) else CARTAO, border_width=2,
                         border_color=ROXO if marcado else AZUL if iso == hoje else BORDA)
             l_dia.configure(text=f"{dia}" + (" ●" if iso == hoje else ""), text_color=TEXTO)
             if rec:
@@ -1045,6 +1445,8 @@ class App(ctk.CTk):
                 l_des.configure(text="")
             if sfim < 0:
                 l_sal.configure(text=f"!−{compacto(sfim)}", text_color=TEXTO)
+            elif baixo:
+                l_sal.configure(text=f"⚠{compacto(sfim)}", text_color=TEXTO)
             elif tem or sfim:
                 l_sal.configure(text=compacto(sfim), text_color=MUTED)
             else:
@@ -1071,7 +1473,7 @@ class App(ctk.CTk):
             self.l_dia_resumo.configure(
                 text=f"{n} dia(s) · Entradas {brl(r_)} · Saídas {brl(s_)}\n"
                      f"Média por {DIAS_LONGOS[i].split('-')[0].lower()}: +{brl(r_ // max(n, 1))} / "
-                     f"−{brl(s_ // max(n, 1))}")
+                     f"−{brl(s_ // max(n, 1))}" + self._txt_historico(i))
         self.tree_dia.delete(*self.tree_dia.get_children())
         for d in sorted(itens, key=lambda x: (x["data"], x["descricao"].lower())):
             tag = d["tipo"] if d["pago"] else ("vencido" if vencido(d) else "pendente")
@@ -1232,7 +1634,7 @@ class App(ctk.CTk):
     def garantir_categoria(self, tipo, cat):
         """Devolve (nome_normalizado, é_nova)."""
         lista = self.cfg["categorias"][tipo]
-        cat = cat.strip()
+        cat = " ".join(cat.split())[:MAX_CAT] or "Outros"
         cat = cat[:1].upper() + cat[1:]
         existente = next((c for c in lista if c.lower() == cat.lower()), None)
         if existente:
@@ -1248,6 +1650,8 @@ class App(ctk.CTk):
         desc = self.e_desc.get().strip()
         if not desc:
             return self.aviso("Informe a descrição.")
+        if len(desc) > MAX_DESC:
+            return self.aviso(f"Descrição muito longa (máximo {MAX_DESC} letras).")
         try:
             cents = parse_centavos(self.e_valor.get())
         except (ValueError, InvalidOperation):
@@ -1258,14 +1662,33 @@ class App(ctk.CTk):
             return self.aviso("Data inválida (use dd/mm/aaaa).")
         if not 2000 <= d.year <= 2100:
             return self.aviso("Ano fora do intervalo 2000–2100.")
-        n = 1
-        if not self.editando:
-            txt = self.e_rep.get().strip() or "1"
-            if not txt.isdigit() or not 1 <= int(txt) <= 60:
-                return self.aviso("Repetições: número de 1 a 60.")
-            n = int(txt)
         if not self.cat.get().strip():
             return self.aviso("Informe a categoria.")
+        if len(self.cat.get().strip()) > MAX_CAT:
+            return self.aviso(f"Categoria muito longa (máximo {MAX_CAT} letras).")
+
+        datas, numerar = [d], False
+        if not self.editando and self.m_rep.get() != MODOS_REP[0]:
+            modo = self.m_rep.get()
+            limite = 60 if modo == MODOS_REP[1] else 52
+            txt = self.e_rep.get().strip() or "1"
+            if not txt.isdigit() or not 1 <= int(txt) <= limite:
+                return self.aviso(f"Repetições: número de 1 a {limite}.")
+            n = int(txt)
+            if modo == MODOS_REP[1]:      # todo mês (numera: 1/12, 2/12...)
+                datas, numerar = [add_months(d, i) for i in range(n)], n > 1
+            elif modo == MODOS_REP[2]:    # toda semana
+                datas = [d + timedelta(days=7 * i) for i in range(n)]
+            else:                         # só nos dias da semana escolhidos, por n semanas
+                dias = {i for i in range(7) if self.rep_dias[i]}
+                if not dias:
+                    return self.aviso("Escolha pelo menos um dia da semana.")
+                datas = [x for x in (d + timedelta(days=k) for k in range(7 * n))
+                         if (x.weekday() + 1) % 7 in dias]
+            if len(datas) > MAX_LOTE:
+                return self.aviso(f"Isso criaria {len(datas)} lançamentos (máximo {MAX_LOTE} de uma vez).")
+            if datas[-1].year > 2100:
+                return self.aviso("A repetição passa do ano 2100.")
 
         tipo = self.tipo.get()
         cat, nova = self.garantir_categoria(tipo, self.cat.get())
@@ -1279,17 +1702,22 @@ class App(ctk.CTk):
             self.cancelar_edicao()
             msg = "Lançamento atualizado."
         else:
-            for i in range(n):
-                dt = add_months(d, i)
-                self.lanc.append({"id": uuid.uuid4().hex, "tipo": tipo,
-                                  "descricao": f"{desc} ({i + 1}/{n})" if n > 1 else desc,
-                                  "categoria": cat, "centavos": cents, "data": dt.isoformat(),
-                                  "pago": pago and (i == 0 or dt <= date.today())})
+            serie = uuid.uuid4().hex if len(datas) > 1 else None
+            hoje = date.today()
+            for i, dt in enumerate(datas):
+                novo = {"id": uuid.uuid4().hex, "tipo": tipo,
+                        "descricao": f"{desc} ({i + 1}/{len(datas)})" if numerar else desc,
+                        "categoria": cat, "centavos": cents, "data": dt.isoformat(),
+                        "pago": pago and (i == 0 or dt <= hoje)}
+                if serie:
+                    novo["serie"] = serie
+                self.lanc.append(novo)
             self.e_desc.delete(0, "end")
             self.e_valor.delete(0, "end")
-            self.e_rep.delete(0, "end")
             self.var_pago.set(True)
-            msg = f"{n} lançamento(s) adicionado(s)."
+            self.mostrar_rep(resetar=True)
+            msg = ("1 lançamento adicionado." if len(datas) == 1 else
+                   f"{len(datas)} lançamentos adicionados ({datas[0]:%d/%m} a {datas[-1]:%d/%m}).")
         self.salvar()
         if nova:
             self.sincronizar_categorias()
@@ -1306,29 +1734,37 @@ class App(ctk.CTk):
         self.tipo.set(d["tipo"])
         self.trocar_tipo(d["tipo"])
         self.cat.set(d["categoria"])
-        self.e_rep.configure(state="normal")
         for e, v in ((self.e_desc, d["descricao"]), (self.e_valor, fmt_input(d["centavos"])),
                      (self.e_data, datetime.fromisoformat(d["data"]).strftime("%d/%m/%Y"))):
             e.delete(0, "end")
             e.insert(0, v)
         self.var_pago.set(d["pago"])
-        self.e_rep.delete(0, "end")
-        self.e_rep.configure(state="disabled")
+        self.f_rep.pack_forget()  # repetição só vale ao criar um lançamento novo
+        self._rep_visivel = False
         self.l_modo.configure(text="Editando lançamento")
         self.b_ok.configure(text="💾 Salvar alterações")
         self.b_cancel.grid(row=0, column=1, padx=(8, 0))
 
+    def data_padrao(self) -> date:
+        """Data inicial do formulário: o dia selecionado no calendário (ou hoje)."""
+        try:
+            return date.fromisoformat(self.sel[1]) if self.sel[0] == "dia" else date.today()
+        except ValueError:
+            return date.today()
+
     def cancelar_edicao(self):
+        estava_editando = self.editando is not None
         self.editando = None
-        self.e_rep.configure(state="normal")
         self.e_desc.delete(0, "end")
         self.e_valor.delete(0, "end")
         self.e_data.delete(0, "end")
-        self.e_data.insert(0, date.today().strftime("%d/%m/%Y"))
+        self.e_data.insert(0, self.data_padrao().strftime("%d/%m/%Y"))
         self.var_pago.set(True)
         self.l_modo.configure(text="Novo lançamento")
         self.b_ok.configure(text="＋ Adicionar")
         self.b_cancel.grid_remove()
+        # a repetição escolhida só é zerada se estávamos editando (senão o usuário perderia o que marcou)
+        self.mostrar_rep(resetar=estava_editando)
 
     def alternar_status(self):
         sel = self.sel_ids()
@@ -1346,9 +1782,23 @@ class App(ctk.CTk):
         sel = self.sel_ids()
         if not sel:
             return self.aviso("Selecione o que excluir.")
-        if not messagebox.askyesno("Excluir", f"Excluir {len(sel)} lançamento(s)?"):
+        ids, perguntou = set(sel), False
+        if len(sel) == 1:
+            d = self.achar(sel[0])
+            seguintes = ([x for x in self.lanc if x.get("serie") == d["serie"] and x["data"] >= d["data"]]
+                         if d and d.get("serie") else [])
+            if len(seguintes) > 1:  # faz parte de uma repetição: oferece apagar os seguintes também
+                r = messagebox.askyesnocancel(
+                    "Excluir", "Este lançamento faz parte de uma repetição.\n\n"
+                               f"Sim = excluir este e os {len(seguintes) - 1} seguinte(s)\n"
+                               "Não = excluir só este\nCancelar = não excluir")
+                if r is None:
+                    return
+                if r:
+                    ids = {x["id"] for x in seguintes}
+                perguntou = True
+        if not perguntou and not messagebox.askyesno("Excluir", f"Excluir {len(ids)} lançamento(s)?"):
             return
-        ids = set(sel)
         self.lixeira = [d for d in self.lanc if d["id"] in ids]
         self.lanc = [d for d in self.lanc if d["id"] not in ids]
         if self.editando in ids:
@@ -1356,7 +1806,7 @@ class App(ctk.CTk):
         self.salvar()
         self.atualizar()
         self.tree.focus_set()
-        self.aviso("Excluído. Ctrl+Z desfaz.", ok=True)
+        self.aviso(f"{len(ids)} lançamento(s) excluído(s). Ctrl+Z desfaz.", ok=True)
 
     def desfazer(self, _e=None):
         try:
@@ -1386,29 +1836,40 @@ class App(ctk.CTk):
                 w.writerow(["Data", "Tipo", "Categoria", "Descrição", "Valor", "Status"])
                 for d in sorted(self.lanc, key=lambda x: x["data"]):
                     w.writerow([datetime.fromisoformat(d["data"]).strftime("%d/%m/%Y"), d["tipo"],
-                                d["categoria"], d["descricao"], fmt_input(d["centavos"]),
-                                "Pago" if d["pago"] else "Pendente"])
+                                csv_seguro(d["categoria"]), csv_seguro(d["descricao"]),
+                                fmt_input(d["centavos"]), "Pago" if d["pago"] else "Pendente"])
         except OSError as e:
             return messagebox.showerror("Exportar", str(e))
         self.aviso("CSV exportado.", ok=True)
 
     def importar(self):
-        caminho = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+        caminho = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Todos os arquivos", "*.*")])
         if not caminho:
             return
+        try:
+            if os.path.getsize(caminho) > 5_000_000:
+                return messagebox.showerror("Importar", "Arquivo grande demais (máximo 5 MB).")
+        except OSError as e:
+            return messagebox.showerror("Importar", str(e))
         chaves = {(d["data"], d["tipo"], d["categoria"], d["descricao"], d["centavos"]) for d in self.lanc}
         novos, ignorados = [], 0
         try:
             with open(caminho, newline="", encoding="utf-8-sig") as f:
-                for lin in csv.DictReader(f, delimiter=";"):
+                amostra = f.readline()
+                f.seek(0)
+                sep = max([";", ",", "\t"], key=amostra.count)  # ; (Excel BR), vírgula ou tab
+                for n, lin in enumerate(csv.DictReader(f, delimiter=sep)):
+                    if n >= 20000:
+                        ignorados += 1
+                        break
                     try:
                         tipo = lin["Tipo"].strip().capitalize()
                         if tipo not in ("Receita", "Despesa"):
                             raise ValueError
                         dt = parse_data(lin["Data"])
                         cents = parse_centavos(lin["Valor"])
-                        desc = lin["Descrição"].strip()
-                        cat = (lin["Categoria"] or "").strip() or "Outros"
+                        desc = csv_limpo(lin["Descrição"].strip())[:MAX_DESC]
+                        cat = csv_limpo((lin["Categoria"] or "").strip())[:MAX_CAT] or "Outros"
                         pago = (lin.get("Status") or "Pago").strip().lower() not in ("pendente", "vencido")
                         if not desc:
                             raise ValueError
@@ -1426,10 +1887,11 @@ class App(ctk.CTk):
             return messagebox.showerror("Importar", f"Não consegui ler o arquivo:\n{e}")
         if not novos:
             return messagebox.showinfo("Importar", f"Nada novo para importar ({ignorados} linha(s) ignorada(s)).")
-        if not messagebox.askyesno("Importar", f"Importar {len(novos)} lançamento(s)?\n({ignorados} ignorado(s): duplicados ou inválidos)"):
+        if not messagebox.askyesno("Importar", f"Importar {len(novos)} lançamento(s)?\n"
+                                               f"({ignorados} ignorado(s): duplicados ou inválidos)"):
             return
-        for d in novos:
-            self.garantir_categoria(d["tipo"], d["categoria"])
+        for d in novos:  # usa o nome normalizado da categoria (evita 'alimentação' x 'Alimentação')
+            d["categoria"], _ = self.garantir_categoria(d["tipo"], d["categoria"])
         self.lanc.extend(novos)
         self.salvar()
         self.sincronizar_categorias()
@@ -1485,9 +1947,12 @@ class App(ctk.CTk):
         return self.lanc if p is None else [d for d in self.lanc if d["data"].startswith(p)]
 
     def mover_mes(self, delta):
+        if self.filtro.get() == "Todos":  # sai do 'Todos' direto para o mês atual
+            self.filtro.set(date.today().strftime("%m/%Y"))
+            return self.atualizar()
         ops = list(self.filtro.cget("values"))
         i = ops.index(self.filtro.get()) if self.filtro.get() in ops else 0
-        self.filtro.set(ops[max(0, min(len(ops) - 1, i + delta))])
+        self.filtro.set(ops[max(1, min(len(ops) - 1, i + delta))])  # nunca cai em 'Todos' sem querer
         self.atualizar()
 
     def ordenar(self, col):
